@@ -1,0 +1,18 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.10
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+        args: [--check]
+
+  - repo: local
+    hooks:
+      - id: unittest
+        name: unittest
+        entry: .venv/bin/python -m unittest discover -s tests
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

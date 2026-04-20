@@ -1,0 +1,87 @@
+[project]
+name = "ai-ocr-pipeline"
+version = "0.1.0"
+description = "OCR pipeline CLI wrapping ndlocr-lite. Extracts text boxes with content, dimensions, and center positions from PDF/images."
+readme = "README.md"
+license = { file = "LICENSE" }
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "src/ai_ocr_pipeline/_vendored/deskew_ht/LICENSE_deskew_ht",
+]
+requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: Console",
+]
+dependencies = [
+    "click>=8.1.0",
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "pillow>=10.0.0",
+    "pypdfium2>=4.30.0",
+    "numpy>=2.0.0",
+    "opencv-python-headless>=4.10.0",
+    "scikit-image>=0.22.0",
+    "pyyaml>=6.0.0",
+    "ndlocr-lite @ git+https://github.com/ndl-lab/ndlocr-lite.git",
+]
+
+[project.scripts]
+ai-ocr-pipeline = "ai_ocr_pipeline.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_ocr_pipeline"]
+
+[tool.hatch.build.targets.editable]
+packages = ["src/ai_ocr_pipeline"]
+
+[dependency-groups]
+dev = [
+    "build>=1.2.2",
+    "pre-commit>=4.3.0",
+    "reportlab>=4.2.5",
+    "ruff>=0.15.10",
+]
+
+[tool.ruff]
+src = ["src", "tests", "scripts"]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["src/ai_ocr_pipeline/_vendored"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",   # line length (formatter handles it)
+    "B008",   # function call in default arg (typer/click pattern)
+    "SIM108", # ternary operator (readability preference)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]
+"scripts/*.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ai_ocr_pipeline"]

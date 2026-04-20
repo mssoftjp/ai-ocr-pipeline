@@ -1,0 +1,16 @@
+{
+  "name": "ai-ocr-pipeline-web-tests",
+  "private": true,
+  "scripts": {
+    "serve:tools": "python3 -m http.server 4173 --bind 127.0.0.1",
+    "test:editor": "playwright test e2e/template-editor.spec.js",
+    "test:editor:all": "playwright test e2e/template-editor.spec.js e2e/template-editor-visual.spec.js",
+    "test:editor:visual": "playwright test e2e/template-editor-visual.spec.js",
+    "test:editor:visual:update": "playwright test e2e/template-editor-visual.spec.js --update-snapshots",
+    "test:editor:headed": "playwright test e2e/template-editor.spec.js --headed",
+    "test:editor:ui": "playwright test e2e/template-editor.spec.js --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.0"
+  }
+}

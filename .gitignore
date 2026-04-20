@@ -1,0 +1,49 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+.env.*
+.envrc
+.direnv/
+
+# Local tool state
+.claude/
+AGENTS.md
+.idea/
+.vscode/
+*.code-workspace
+
+# Local test/working directory
+tmp/
+htmlcov/
+*.log
+
+# OS-generated files
+.DS_Store
+*.swp
+*.swo
+
+# Node / Playwright
+node_modules/
+playwright-report/
+test-results/
+e2e/
+
+# Certificates / keys
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
