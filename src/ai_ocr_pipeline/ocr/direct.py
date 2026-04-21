@@ -49,12 +49,35 @@ _engine_cache: dict[str, _EngineBundle] = {}
 _engine_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
+SPLIT_LEVEL_PARAMS: dict[int, tuple[float, float]] = {
+    1: (1.50, 5.00),
+    2: (1.00, 10.0 / 3.0),
+    3: (0.60, 2.00),
+    4: (0.30, 1.00),
+    5: (0.15, 0.50),
+}
+DEFAULT_SPLIT_LEVEL = 2
+DEFAULT_MIN_GAP_HEIGHT_RATIO, DEFAULT_GAP_SCORE_THRESHOLD = SPLIT_LEVEL_PARAMS[DEFAULT_SPLIT_LEVEL]
+
 
 def _ndlocr_lite_root() -> Path:
     """Return the installed ndlocr-lite site-packages root (for weights)."""
     import ocr as ndlocr_main  # top-level ``ocr`` in ndlocr-lite
 
     return Path(ndlocr_main.__file__).resolve().parent
+
+
+def split_params_for_level(level: int) -> tuple[float, float]:
+    """Return ``(min_gap_height_ratio, gap_score_threshold)`` for a split level."""
+    try:
+        return SPLIT_LEVEL_PARAMS[level]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported OCR split level: {level}") from exc
+
+
+def split_params_for_legacy_sensitivity(sensitivity: float) -> tuple[float, float]:
+    """Translate the legacy sensitivity float into direct split parameters."""
+    return 0.15 / sensitivity, 0.5 / sensitivity
 
 
 def _build_engine(device: str) -> _EngineBundle:
@@ -173,6 +196,77 @@ def _find_gap_intervals(
     if run_start is not None and blank.size - run_start >= min_gap_px:
         gaps.append((run_start, int(blank.size)))
     return gaps
+
+
+def _find_text_and_gap_runs(
+    projection: np.ndarray,
+    *,
+    text_threshold: float,
+    min_gap_px: int,
+) -> list[tuple[int, int, bool]]:
+    """Return ``[(start, end, is_text), ...]`` runs for a 1D density profile.
+
+    Blank runs narrower than ``min_gap_px`` are promoted to text so that
+    inter-character spacing does not become a split candidate.
+    """
+    if projection.size == 0:
+        return []
+
+    blank = projection <= text_threshold
+    runs: list[tuple[int, int, bool]] = []
+    run_start = 0
+    current_is_text = not bool(blank[0])
+    for idx in range(1, blank.size):
+        is_text = not bool(blank[idx])
+        if is_text == current_is_text:
+            continue
+        runs.append((run_start, idx, current_is_text))
+        run_start = idx
+        current_is_text = is_text
+    runs.append((run_start, int(blank.size), current_is_text))
+
+    promoted: list[tuple[int, int, bool]] = []
+    for start, end, is_text in runs:
+        if not is_text and end - start < min_gap_px:
+            promoted.append((start, end, True))
+        else:
+            promoted.append((start, end, is_text))
+
+    merged: list[tuple[int, int, bool]] = []
+    for start, end, is_text in promoted:
+        if not merged or merged[-1][2] != is_text:
+            merged.append((start, end, is_text))
+            continue
+        prev_start, _prev_end, prev_is_text = merged[-1]
+        merged[-1] = (prev_start, end, prev_is_text)
+    return merged
+
+
+def _score_and_filter_gaps(
+    runs: list[tuple[int, int, bool]],
+    *,
+    threshold: float,
+    min_text_run_px: int,
+) -> list[tuple[int, int]]:
+    """Keep only gap runs that are proportionally large relative to neighbors."""
+    accepted: list[tuple[int, int]] = []
+    for idx in range(1, len(runs) - 1):
+        start, end, is_text = runs[idx]
+        if is_text:
+            continue
+        left_start, left_end, left_is_text = runs[idx - 1]
+        right_start, right_end, right_is_text = runs[idx + 1]
+        if not left_is_text or not right_is_text:
+            continue
+        gap_width = end - start
+        left_width = left_end - left_start
+        right_width = right_end - right_start
+        denom = max(min_text_run_px, min(left_width, right_width))
+        if denom <= 0:
+            continue
+        if gap_width / denom > threshold:
+            accepted.append((start, end))
+    return accepted
 
 
 def _compute_column_text_density(crop: np.ndarray) -> np.ndarray:
@@ -304,6 +398,92 @@ def deduplicate_lines(
     for parent, child in to_remove:
         parent.remove(child)
     return len(to_remove)
+
+
+def suppress_contained_fragments(
+    boxes: list[TextBox],
+    *,
+    text_containment_threshold: float = 0.3,
+    text_height_similarity_threshold: float = 0.7,
+    text_width_similarity_threshold: float = 0.2,
+    geometric_containment_threshold: float = 0.95,
+    geometric_height_similarity_threshold: float = 0.85,
+    geometric_width_similarity_threshold: float = 0.4,
+) -> list[TextBox]:
+    """Remove smaller fragment boxes that duplicate a larger parent box.
+
+    Tier 1 removes text-confirmed fragments where the child text is a
+    substring of the parent text and the boxes overlap on the same line.
+    Tier 2 removes near-fully-contained garbage fragments even when OCR text
+    does not match, as long as the geometry is still strongly indicative of a
+    nested duplicate rather than a distinct table cell.
+    """
+    if len(boxes) <= 1:
+        return boxes
+
+    indexed_boxes = list(enumerate(boxes))
+    indexed_boxes.sort(
+        key=lambda item: (
+            -(item[1].width * item[1].height),
+            -item[1].height,
+            item[1].y,
+            item[1].x,
+        )
+    )
+
+    suppressed_indices: set[int] = set()
+    for parent_idx, parent in indexed_boxes:
+        if parent_idx in suppressed_indices:
+            continue
+        parent_text = parent.text.strip()
+        if not parent_text:
+            continue
+        parent_x1 = parent.x
+        parent_y1 = parent.y
+        parent_x2 = parent.x + parent.width
+        parent_y2 = parent.y + parent.height
+        parent_area = parent.width * parent.height
+        if parent_area <= 0:
+            continue
+
+        for child_idx, child in indexed_boxes:
+            if child_idx == parent_idx or child_idx in suppressed_indices:
+                continue
+            child_area = child.width * child.height
+            if child_area <= 0 or child_area >= parent_area:
+                continue
+            child_text = child.text.strip()
+
+            child_x1 = child.x
+            child_y1 = child.y
+            child_x2 = child.x + child.width
+            child_y2 = child.y + child.height
+            inter_x = max(0.0, min(parent_x2, child_x2) - max(parent_x1, child_x1))
+            inter_y = max(0.0, min(parent_y2, child_y2) - max(parent_y1, child_y1))
+            inter = inter_x * inter_y
+            containment = inter / child_area
+
+            height_similarity = min(parent.height, child.height) / max(parent.height, child.height)
+            width_similarity = min(parent.width, child.width) / max(parent.width, child.width)
+
+            is_text_fragment = (
+                bool(child_text)
+                and child_text in parent_text
+                and containment >= text_containment_threshold
+                and height_similarity >= text_height_similarity_threshold
+                and width_similarity >= text_width_similarity_threshold
+            )
+            is_geometric_fragment = (
+                containment >= geometric_containment_threshold
+                and height_similarity >= geometric_height_similarity_threshold
+                and width_similarity >= geometric_width_similarity_threshold
+            )
+            if not is_text_fragment and not is_geometric_fragment:
+                continue
+
+            suppressed_indices.add(child_idx)
+
+    return [box for idx, box in enumerate(boxes) if idx not in suppressed_indices]
 
 
 def _clip_rect_to_image(
@@ -506,9 +686,10 @@ def split_wide_lines_at_whitespace(
     root: ET.Element,
     image: np.ndarray,
     *,
-    min_aspect_ratio: float = 6.0,
+    min_aspect_ratio: float = 4.0,
     min_width_ratio: float = 0.05,
-    gap_min_height_ratio: float = 2.5,
+    min_gap_height_ratio: float = DEFAULT_MIN_GAP_HEIGHT_RATIO,
+    gap_score_threshold: float = DEFAULT_GAP_SCORE_THRESHOLD,
     text_threshold: float = 0.02,
     min_segment_height_ratio: float = 0.25,
 ) -> int:
@@ -526,21 +707,21 @@ def split_wide_lines_at_whitespace(
         root: Parsed XML (``OCRDATASET`` root) with ``<LINE>`` elements.
         image: The full-page RGB/gray ``np.ndarray`` used to extract crops.
         min_aspect_ratio: Only consider LINEs whose ``width / height`` is at
-            least this value. Avoids splitting stacked vertical text.
+            least this value. Avoids splitting stacked vertical text while
+            still allowing moderately wide table rows through.
         min_width_ratio: Only consider LINEs whose width is at least this
             fraction of the full page width. Avoids splitting short phrases
             that happen to be wide.
-        gap_min_height_ratio: A blank stripe counts as a gap only if its
-            width is at least ``height * this_ratio``. In mixed CJK +
-            ASCII / numeric forms a character is typically ~0.5x line
-            height wide, so the default ``2.5`` corresponds to roughly
-            "5 character widths" of whitespace — the point at which a
-            gap reads as a column boundary rather than intra-cell space.
+        min_gap_height_ratio: Minimum blank-run width, relative to line
+            height, to treat as a candidate gap.
+        gap_score_threshold: Minimum gap score required to accept a split.
         text_threshold: A column counts as blank if the fraction of text
             pixels in it is ``<=`` this value.
         min_segment_height_ratio: Post-split, each segment must be at least
             ``height * this_ratio`` wide. Narrower slivers are merged back
-            into the nearest non-sliver neighbour.
+            into the nearest non-sliver neighbour. This quality gate is kept
+            independent from ``sensitivity`` so that the user-controlled
+            split knob only affects gap detection.
 
     Returns the number of LINEs that were replaced with >=2 segments.
     """
@@ -584,10 +765,21 @@ def split_wide_lines_at_whitespace(
         if density.size == 0:
             continue
 
-        min_gap_px = max(1, int(h * gap_min_height_ratio))
-        min_seg_px = max(1, int(h * min_segment_height_ratio))
+        noise_floor = max(3, int(clipped_h * min_gap_height_ratio))
+        split_threshold = gap_score_threshold
+        min_seg_px = max(1, int(clipped_h * min_segment_height_ratio))
+        min_text_run_px = max(3, int(clipped_h * 0.3))
 
-        gaps = _find_gap_intervals(density, text_threshold=text_threshold, min_gap_px=min_gap_px)
+        runs = _find_text_and_gap_runs(
+            density,
+            text_threshold=text_threshold,
+            min_gap_px=noise_floor,
+        )
+        gaps = _score_and_filter_gaps(
+            runs,
+            threshold=split_threshold,
+            min_text_run_px=min_text_run_px,
+        )
         if not gaps:
             continue
 
@@ -712,6 +904,8 @@ def run_direct_ocr(
     device: str = "cpu",
     filter_container_fallbacks: bool = True,
     split_wide_lines: bool = True,
+    split_min_gap_height_ratio: float = DEFAULT_MIN_GAP_HEIGHT_RATIO,
+    split_gap_score_threshold: float = DEFAULT_GAP_SCORE_THRESHOLD,
     filter_oversized: bool = True,
     deduplicate: bool = True,
     xml_hook: Callable[[ET.Element], None] | None = None,
@@ -762,7 +956,12 @@ def run_direct_ocr(
         drop_container_fallback_lines(root)
 
     if split_wide_lines:
-        split_wide_lines_at_whitespace(root, img)
+        split_wide_lines_at_whitespace(
+            root,
+            img,
+            min_gap_height_ratio=split_min_gap_height_ratio,
+            gap_score_threshold=split_gap_score_threshold,
+        )
 
     if filter_oversized:
         filter_oversized_lines(root, img_height=img_h)
@@ -846,6 +1045,8 @@ def run_direct_ocr(
                 text_source="ocr",
             )
         )
+
+    boxes = suppress_contained_fragments(boxes)
 
     return PageResult(
         source=source or Path(image_path).name,

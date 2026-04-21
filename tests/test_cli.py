@@ -54,6 +54,8 @@ def _run_cli(
     ocr_backend: str = "direct",
     filter_container_fallbacks: bool = True,
     split_wide_lines: bool = True,
+    split_level: int = 2,
+    split_gap_sensitivity: float | None = None,
     template: Path | None = None,
     template_boxes: str | None = None,
     engine: str | None = None,
@@ -82,6 +84,8 @@ def _run_cli(
         ocr_backend=ocr_backend,
         filter_container_fallbacks=filter_container_fallbacks,
         split_wide_lines=split_wide_lines,
+        split_level=split_level,
+        split_gap_sensitivity=split_gap_sensitivity,
         template=template,
         template_boxes=template_boxes,
         use_lmstudio=use_lmstudio,
@@ -1997,6 +2001,131 @@ class CliInterfaceTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertIn("--llm-* options ignored in --ndl mode", result.output)
+
+    def test_cli_rejects_non_positive_split_gap_sensitivity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "sample.png"
+            Image.new("RGB", (10, 10), (255, 255, 255)).save(image_path)
+
+            result = RUNNER.invoke(cli.app, [str(image_path), "--ndl", "--ocr-split-gap-sensitivity", "0"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--ocr-split-gap-sensitivity must be greater than 0", result.output)
+
+    def test_run_emits_default_split_level_metadata(self) -> None:
+        processed = cli._CandidateResult(
+            image_path=Path("/tmp/sample.png"),
+            variant_name="natural",
+            result=_result(
+                boxes=[TextBox(text="A", width=10, height=10, center_x=5.0, center_y=5.0, confidence=0.9)],
+                source="sample.png",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "sample.png"
+            output_path = tmp_path / "result.json"
+            Image.new("RGB", (10, 10), (255, 255, 255)).save(image_path)
+
+            with patch.object(cli, "_process_image", return_value=processed):
+                _run_cli(image_path, output=output_path)
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["meta"]["ocr"]["split_level"], 2)
+        self.assertEqual(payload["meta"]["ocr"]["split_min_gap_height_ratio"], 1.0)
+        self.assertAlmostEqual(payload["meta"]["ocr"]["split_gap_score_threshold"], 10.0 / 3.0)
+        self.assertIsNone(payload["meta"]["ocr"]["split_gap_sensitivity"])
+
+    def test_run_legacy_split_gap_sensitivity_maps_to_direct_params(self) -> None:
+        processed = cli._CandidateResult(
+            image_path=Path("/tmp/sample.png"),
+            variant_name="natural",
+            result=_result(
+                boxes=[TextBox(text="A", width=10, height=10, center_x=5.0, center_y=5.0, confidence=0.9)],
+                source="sample.png",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "sample.png"
+            output_path = tmp_path / "result.json"
+            Image.new("RGB", (10, 10), (255, 255, 255)).save(image_path)
+
+            with patch.object(cli, "_process_image", return_value=processed):
+                _run_cli(image_path, output=output_path, split_gap_sensitivity=0.1)
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertIsNone(payload["meta"]["ocr"]["split_level"])
+        self.assertEqual(payload["meta"]["ocr"]["split_gap_sensitivity"], 0.1)
+        self.assertAlmostEqual(payload["meta"]["ocr"]["split_min_gap_height_ratio"], 1.5)
+        self.assertAlmostEqual(payload["meta"]["ocr"]["split_gap_score_threshold"], 5.0)
+
+    def test_cli_warns_when_split_level_is_ignored_for_subprocess_backend(self) -> None:
+        processed = cli._CandidateResult(
+            image_path=Path("/tmp/sample.png"),
+            variant_name="natural",
+            result=_result(
+                boxes=[TextBox(text="A", width=10, height=10, center_x=5.0, center_y=5.0, confidence=0.9)],
+                source="sample.png",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "sample.png"
+            Image.new("RGB", (10, 10), (255, 255, 255)).save(image_path)
+
+            with patch.object(cli, "_process_image", return_value=processed):
+                result = RUNNER.invoke(
+                    cli.app,
+                    [
+                        str(image_path),
+                        "--ndl",
+                        "--ocr-backend",
+                        "subprocess",
+                        "--ocr-split-level",
+                        "4",
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("--ocr-split-level is ignored unless --ocr-backend direct is used", result.output)
+
+    def test_cli_warns_when_legacy_split_gap_sensitivity_is_ignored_for_subprocess_backend(self) -> None:
+        processed = cli._CandidateResult(
+            image_path=Path("/tmp/sample.png"),
+            variant_name="natural",
+            result=_result(
+                boxes=[TextBox(text="A", width=10, height=10, center_x=5.0, center_y=5.0, confidence=0.9)],
+                source="sample.png",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "sample.png"
+            Image.new("RGB", (10, 10), (255, 255, 255)).save(image_path)
+
+            with patch.object(cli, "_process_image", return_value=processed):
+                result = RUNNER.invoke(
+                    cli.app,
+                    [
+                        str(image_path),
+                        "--ndl",
+                        "--ocr-backend",
+                        "subprocess",
+                        "--ocr-split-gap-sensitivity",
+                        "2.0",
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("--ocr-split-gap-sensitivity is ignored unless --ocr-backend direct is used", result.output)
 
     def test_cli_pretty_forces_pretty_json_on_non_tty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

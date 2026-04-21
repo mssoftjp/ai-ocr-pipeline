@@ -26,7 +26,15 @@ from ai_ocr_pipeline.llm import (
     resolve_model,
 )
 from ai_ocr_pipeline.models import PageResult, PageSerializationOptions, TextBox
-from ai_ocr_pipeline.ocr import parse_ocr_json, run_direct_ocr, run_ocr, score_result
+from ai_ocr_pipeline.ocr import (
+    DEFAULT_SPLIT_LEVEL,
+    parse_ocr_json,
+    run_direct_ocr,
+    run_ocr,
+    score_result,
+    split_params_for_legacy_sensitivity,
+    split_params_for_level,
+)
 from ai_ocr_pipeline.overlay import write_overlay_artifact
 from ai_ocr_pipeline.pdf import extract_pdf_text_layers, pdf_to_images
 from ai_ocr_pipeline.preprocess import build_inverted_variant, build_line_removed_variant, ensure_rgb
@@ -88,6 +96,10 @@ def _effective_template_newline_handling(template_obj: Template | None) -> str |
     if template_obj is None:
         return None
     return template_obj.preprocess_newline_handling or "preserve"
+
+
+def _split_level_bounds() -> tuple[int, int]:
+    return 1, 5
 
 
 @dataclass(frozen=True)
@@ -392,6 +404,8 @@ def _build_template_crop_ocr_evidence(
     ocr_backend: str,
     filter_container_fallbacks: bool,
     split_wide_lines: bool,
+    split_min_gap_height_ratio: float = 1.0,
+    split_gap_score_threshold: float = 10.0 / 3.0,
 ) -> PageResult:
     """Run OCR on strict template-owned crops and attach the results as evidence."""
     ocr_results_by_index: dict[int, PageResult] = {}
@@ -420,6 +434,8 @@ def _build_template_crop_ocr_evidence(
                 ocr_backend=ocr_backend,
                 filter_container_fallbacks=filter_container_fallbacks,
                 split_wide_lines=split_wide_lines,
+                split_min_gap_height_ratio=split_min_gap_height_ratio,
+                split_gap_score_threshold=split_gap_score_threshold,
             )
 
     return build_ocr_evidence(page_result, ocr_results_by_index, low_ink_by_index=low_ink_by_index)
@@ -436,6 +452,8 @@ def _run_ocr_for_image(
     ocr_backend: str = "direct",
     filter_container_fallbacks: bool = True,
     split_wide_lines: bool = True,
+    split_min_gap_height_ratio: float = 1.0,
+    split_gap_score_threshold: float = 10.0 / 3.0,
 ) -> PageResult:
     """Run OCR for a prepared image file and parse the result."""
     if ocr_backend == "direct":
@@ -447,6 +465,8 @@ def _run_ocr_for_image(
             device=device,
             filter_container_fallbacks=filter_container_fallbacks,
             split_wide_lines=split_wide_lines,
+            split_min_gap_height_ratio=split_min_gap_height_ratio,
+            split_gap_score_threshold=split_gap_score_threshold,
         )
 
     ocr_output_dir = work_dir / f"ocr_output_{image_path.stem}"
@@ -475,6 +495,8 @@ def _process_template_image(
     ocr_backend: str = "direct",
     filter_container_fallbacks: bool = True,
     split_wide_lines: bool = True,
+    split_min_gap_height_ratio: float = 1.0,
+    split_gap_score_threshold: float = 10.0 / 3.0,
 ) -> _CandidateResult:
     """Process one image through template-mode refinement."""
     prepared_path = _prepare_single_image(
@@ -505,6 +527,8 @@ def _process_template_image(
         ocr_backend=ocr_backend,
         filter_container_fallbacks=filter_container_fallbacks,
         split_wide_lines=split_wide_lines,
+        split_min_gap_height_ratio=split_min_gap_height_ratio,
+        split_gap_score_threshold=split_gap_score_threshold,
     )
     page_result, refine_indices = decide_target_box_actions(
         page_result,
@@ -550,6 +574,8 @@ def _process_image(
     ocr_backend: str = "direct",
     filter_container_fallbacks: bool = True,
     split_wide_lines: bool = True,
+    split_min_gap_height_ratio: float = 1.0,
+    split_gap_score_threshold: float = 10.0 / 3.0,
 ) -> _CandidateResult:
     """Process a single image through the pipeline."""
     actual_path = ensure_rgb(image_path, work_dir)
@@ -621,6 +647,8 @@ def _process_image(
                 ocr_backend=ocr_backend,
                 filter_container_fallbacks=filter_container_fallbacks,
                 split_wide_lines=split_wide_lines,
+                split_min_gap_height_ratio=split_min_gap_height_ratio,
+                split_gap_score_threshold=split_gap_score_threshold,
             ),
         )
         for variant_name, path, recognition_path in candidate_specs
@@ -730,6 +758,20 @@ def run(
         "--ocr-split-wide-lines/--no-ocr-split-wide-lines",
         help="Split oversized horizontal LINEs at whitespace gaps so table rows become per-cell boxes. Direct backend only.",
         rich_help_panel="Preprocessing",
+    ),
+    split_level: int = typer.Option(
+        DEFAULT_SPLIT_LEVEL,
+        "--ocr-split-level",
+        min=_split_level_bounds()[0],
+        max=_split_level_bounds()[1],
+        help="OCR line split level. Higher values split more aggressively. Direct backend only.",
+        rich_help_panel="Preprocessing",
+    ),
+    split_gap_sensitivity: float | None = typer.Option(
+        None,
+        "--ocr-split-gap-sensitivity",
+        help="Deprecated legacy OCR split sensitivity.",
+        hidden=True,
     ),
     template: Path | None = typer.Option(
         None,
@@ -992,6 +1034,34 @@ def run(
         template_obj=template_obj,
     )
 
+    effective_split_level = split_level
+    effective_split_gap_sensitivity: float | None = None
+    if split_gap_sensitivity is not None:
+        if split_gap_sensitivity <= 0:
+            console.print("[red]--ocr-split-gap-sensitivity must be greater than 0.[/red]")
+            raise typer.Exit(1)
+        effective_split_gap_sensitivity = split_gap_sensitivity
+        if effective_split_gap_sensitivity < 0.1:
+            console.print("[yellow]--ocr-split-gap-sensitivity values below 0.1 are clamped to 0.1.[/yellow]")
+            effective_split_gap_sensitivity = 0.1
+        console.print("[yellow]--ocr-split-gap-sensitivity is deprecated; prefer --ocr-split-level.[/yellow]")
+
+    if ocr_backend != "direct":
+        if split_level != DEFAULT_SPLIT_LEVEL:
+            console.print("[yellow]--ocr-split-level is ignored unless --ocr-backend direct is used.[/yellow]")
+        if split_gap_sensitivity is not None:
+            console.print(
+                "[yellow]--ocr-split-gap-sensitivity is ignored unless --ocr-backend direct is used.[/yellow]"
+            )
+
+    if effective_split_gap_sensitivity is not None:
+        effective_min_gap_height_ratio, effective_gap_score_threshold = split_params_for_legacy_sensitivity(
+            effective_split_gap_sensitivity
+        )
+        effective_split_level = None
+    else:
+        effective_min_gap_height_ratio, effective_gap_score_threshold = split_params_for_level(effective_split_level)
+
     if ai_mode in ("openai", "gemini"):
         console.print(f"[red]--{ai_mode} backend is not yet implemented.[/red]")
         raise typer.Exit(1)
@@ -1185,6 +1255,8 @@ def run(
                             ocr_backend=ocr_backend,
                             filter_container_fallbacks=filter_container_fallbacks,
                             split_wide_lines=split_wide_lines,
+                            split_min_gap_height_ratio=effective_min_gap_height_ratio,
+                            split_gap_score_threshold=effective_gap_score_threshold,
                         )
                     else:
                         result = _process_image(
@@ -1201,6 +1273,8 @@ def run(
                             ocr_backend=ocr_backend,
                             filter_container_fallbacks=filter_container_fallbacks,
                             split_wide_lines=split_wide_lines,
+                            split_min_gap_height_ratio=effective_min_gap_height_ratio,
+                            split_gap_score_threshold=effective_gap_score_threshold,
                         )
                     processed_candidates.append(result)
                     results.append(result.result)
@@ -1305,6 +1379,16 @@ def run(
                 "device": device,
                 "filter_container_fallbacks": (filter_container_fallbacks if ocr_backend == "direct" else None),
                 "split_wide_lines": split_wide_lines if ocr_backend == "direct" else None,
+                "split_level": effective_split_level if ocr_backend == "direct" and split_wide_lines else None,
+                "split_min_gap_height_ratio": (
+                    effective_min_gap_height_ratio if ocr_backend == "direct" and split_wide_lines else None
+                ),
+                "split_gap_score_threshold": (
+                    effective_gap_score_threshold if ocr_backend == "direct" and split_wide_lines else None
+                ),
+                "split_gap_sensitivity": (
+                    effective_split_gap_sensitivity if ocr_backend == "direct" and split_wide_lines else None
+                ),
             }
         )
 
