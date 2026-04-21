@@ -1,6 +1,6 @@
 [project]
 name = "ai-ocr-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 description = "OCR pipeline CLI wrapping ndlocr-lite. Extracts text boxes with content, dimensions, and center positions from PDF/images."
 readme = "README.md"
 license = { file = "LICENSE" }
